@@ -1,0 +1,19 @@
+# Cargo build output
+**/target/
+
+# Rust and Windows debug artifacts
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Local editor and OS metadata
+.vscode/
+.idea/
+*.swp
+*.tmp
+Thumbs.db
+Desktop.ini
+
+# Keep dist/ executables for this comparison workspace.
+# They are the demonstration output files referenced by the READMEs.
