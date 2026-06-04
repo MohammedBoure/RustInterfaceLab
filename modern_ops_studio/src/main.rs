@@ -5,13 +5,20 @@ use eframe::egui::{
     TextEdit, TextStyle, Ui, Vec2,
 };
 use std::cmp::{max, min};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 const ROWS: usize = 80;
 const COLS: usize = 26;
 const CELL_WIDTH: f32 = 116.0;
 const CELL_HEIGHT: f32 = 30.0;
 const ROW_HEADER_WIDTH: f32 = 46.0;
+const ERR_REF: &str = "#REF!";
+const ERR_VALUE: &str = "#VALUE!";
+const ERR_DIV_ZERO: &str = "#DIV/0!";
+const ERR_NAME: &str = "#NAME?";
+const ERR_NUM: &str = "#NUM!";
+const ERR_NA: &str = "#N/A";
+const ERR_CYCLE: &str = "#CYCLE!";
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -29,7 +36,7 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CellAddress {
     row: usize,
     col: usize,
@@ -197,8 +204,59 @@ impl CellAlign {
 enum CalcValue {
     Empty,
     Number(f64),
+    Currency(f64),
+    Percent(f64),
+    Boolean(bool),
+    Date(i64),
     Text(String),
     Error(String),
+}
+
+impl CalcValue {
+    fn numeric_value(&self) -> Option<f64> {
+        match self {
+            Self::Number(value) | Self::Currency(value) | Self::Percent(value) => Some(*value),
+            Self::Boolean(value) => Some(if *value { 1.0 } else { 0.0 }),
+            Self::Date(days) => Some(*days as f64),
+            Self::Text(text) => text_to_number(text),
+            Self::Empty | Self::Error(_) => None,
+        }
+    }
+
+    fn text_value(&self) -> String {
+        match self {
+            Self::Empty => String::new(),
+            Self::Number(value) => format_number(*value),
+            Self::Currency(value) => format!("{:.2}", value),
+            Self::Percent(value) => format!("{:.6}", value),
+            Self::Boolean(value) => {
+                if *value {
+                    "TRUE".to_owned()
+                } else {
+                    "FALSE".to_owned()
+                }
+            }
+            Self::Date(days) => format_date(*days),
+            Self::Text(text) => text.clone(),
+            Self::Error(error) => error.clone(),
+        }
+    }
+
+    fn truthy(&self) -> Result<bool, String> {
+        match self {
+            Self::Boolean(value) => Ok(*value),
+            Self::Number(value) | Self::Currency(value) | Self::Percent(value) => Ok(*value != 0.0),
+            Self::Date(_) => Ok(true),
+            Self::Text(text) => match text.trim().to_ascii_uppercase().as_str() {
+                "TRUE" => Ok(true),
+                "FALSE" => Ok(false),
+                "" => Ok(false),
+                _ => Err(ERR_VALUE.to_owned()),
+            },
+            Self::Empty => Ok(false),
+            Self::Error(error) => Err(error.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +290,12 @@ struct SpreadsheetApp {
     range_name_input: String,
     sort_direction: SortDirection,
     named_ranges: HashMap<String, CellRange>,
+    calculated: Vec<Vec<CalcValue>>,
+    dirty: Vec<Vec<bool>>,
+    dependencies: HashMap<CellAddress, Vec<CellAddress>>,
+    dependents: HashMap<CellAddress, Vec<CellAddress>>,
+    graph_dirty: bool,
+    last_recalc_count: usize,
     show_formulas: bool,
     show_headers: bool,
     zoom: f32,
@@ -257,6 +321,12 @@ impl SpreadsheetApp {
             range_name_input: "Selection".to_owned(),
             sort_direction: SortDirection::Ascending,
             named_ranges: HashMap::new(),
+            calculated: vec![vec![CalcValue::Empty; COLS]; ROWS],
+            dirty: vec![vec![true; COLS]; ROWS],
+            dependencies: HashMap::new(),
+            dependents: HashMap::new(),
+            graph_dirty: true,
+            last_recalc_count: 0,
             show_formulas: false,
             show_headers: true,
             zoom: 1.0,
@@ -395,13 +465,58 @@ impl SpreadsheetApp {
         self.named_ranges.clear();
         self.clipboard.clear();
         self.csv_buffer.clear();
+        self.reset_calculation_state();
         self.status = "Workbook cleared".to_owned();
     }
 
     fn set_raw(&mut self, row: usize, col: usize, value: &str) {
         if row < ROWS && col < COLS {
-            self.cells[row][col].raw = value.to_owned();
+            self.set_cell_raw(CellAddress::new(row, col), value.to_owned());
         }
+    }
+
+    fn set_cell_raw(&mut self, address: CellAddress, value: String) {
+        let address = clamp_address(address);
+        if self.cells[address.row][address.col].raw != value {
+            self.cells[address.row][address.col].raw = value;
+            self.mark_cell_changed(address);
+        }
+    }
+
+    fn reset_calculation_state(&mut self) {
+        self.calculated = vec![vec![CalcValue::Empty; COLS]; ROWS];
+        self.dirty = vec![vec![true; COLS]; ROWS];
+        self.dependencies.clear();
+        self.dependents.clear();
+        self.graph_dirty = true;
+        self.last_recalc_count = 0;
+    }
+
+    fn mark_all_dirty(&mut self) {
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                self.dirty[row][col] = true;
+            }
+        }
+        self.graph_dirty = true;
+    }
+
+    fn mark_cell_changed(&mut self, address: CellAddress) {
+        let address = clamp_address(address);
+        let mut queue = VecDeque::from([address]);
+        let mut seen = HashSet::new();
+        while let Some(current) = queue.pop_front() {
+            if !seen.insert(current) {
+                continue;
+            }
+            self.dirty[current.row][current.col] = true;
+            if let Some(children) = self.dependents.get(&current) {
+                for child in children {
+                    queue.push_back(*child);
+                }
+            }
+        }
+        self.graph_dirty = true;
     }
 
     fn select_cell(&mut self, address: CellAddress) {
@@ -428,30 +543,70 @@ impl SpreadsheetApp {
         }
     }
 
-    fn evaluated_cells(&self) -> Vec<Vec<CalcValue>> {
+    fn evaluated_cells(&mut self) -> Vec<Vec<CalcValue>> {
+        self.recalculate_dirty();
+        self.calculated.clone()
+    }
+
+    fn rebuild_dependency_graph(&mut self) {
+        self.dependencies.clear();
+        self.dependents.clear();
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                let address = CellAddress::new(row, col);
+                let dependencies =
+                    collect_dependencies(&self.cells[row][col].raw, &self.named_ranges);
+                for dependency in &dependencies {
+                    self.dependents
+                        .entry(*dependency)
+                        .or_default()
+                        .push(address);
+                }
+                self.dependencies.insert(address, dependencies);
+            }
+        }
+        self.graph_dirty = false;
+    }
+
+    fn recalculate_dirty(&mut self) {
+        if self.graph_dirty {
+            self.rebuild_dependency_graph();
+        }
+
         let mut cache = vec![vec![None; COLS]; ROWS];
         for row in 0..ROWS {
             for col in 0..COLS {
-                let mut visiting = Vec::new();
-                let _ = evaluate_cell(
-                    &self.cells,
-                    &self.named_ranges,
-                    &mut cache,
-                    &mut visiting,
-                    row,
-                    col,
-                );
+                if !self.dirty[row][col] {
+                    cache[row][col] = Some(self.calculated[row][col].clone());
+                }
             }
         }
 
-        cache
-            .into_iter()
-            .map(|row| {
-                row.into_iter()
-                    .map(|value| value.unwrap_or(CalcValue::Empty))
-                    .collect()
-            })
-            .collect()
+        let mut recalculated = 0usize;
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                if self.dirty[row][col] {
+                    let mut visiting = Vec::new();
+                    let _ = evaluate_cell(
+                        &self.cells,
+                        &self.named_ranges,
+                        &mut cache,
+                        &mut visiting,
+                        row,
+                        col,
+                    );
+                    recalculated += 1;
+                }
+            }
+        }
+
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                self.calculated[row][col] = cache[row][col].clone().unwrap_or(CalcValue::Empty);
+                self.dirty[row][col] = false;
+            }
+        }
+        self.last_recalc_count = recalculated;
     }
 
     fn selected_stats(&self, evaluated: &[Vec<CalcValue>]) -> SelectionStats {
@@ -460,7 +615,9 @@ impl SpreadsheetApp {
         for row in range.start.row..=range.end.row {
             for col in range.start.col..=range.end.col {
                 match &evaluated[row][col] {
-                    CalcValue::Number(value) => {
+                    CalcValue::Number(value)
+                    | CalcValue::Currency(value)
+                    | CalcValue::Percent(value) => {
                         stats.count += 1;
                         stats.sum += value;
                         stats.min = stats
@@ -504,12 +661,13 @@ impl SpreadsheetApp {
         }
 
         let start = self.selected;
-        for (row_offset, line) in self.clipboard.lines().enumerate() {
+        let clipboard = self.clipboard.clone();
+        for (row_offset, line) in clipboard.lines().enumerate() {
             for (col_offset, value) in line.split('\t').enumerate() {
                 let row = start.row + row_offset;
                 let col = start.col + col_offset;
                 if row < ROWS && col < COLS {
-                    self.cells[row][col].raw = value.to_owned();
+                    self.set_cell_raw(CellAddress::new(row, col), value.to_owned());
                 }
             }
         }
@@ -521,6 +679,7 @@ impl SpreadsheetApp {
         for row in range.start.row..=range.end.row {
             for col in range.start.col..=range.end.col {
                 self.cells[row][col] = SpreadsheetCell::default();
+                self.mark_cell_changed(CellAddress::new(row, col));
             }
         }
         self.formula_input.clear();
@@ -538,6 +697,7 @@ impl SpreadsheetApp {
             let template = self.cells[range.start.row][col].clone();
             for row in range.start.row + 1..=range.end.row {
                 self.cells[row][col] = template.clone();
+                self.mark_cell_changed(CellAddress::new(row, col));
             }
         }
         self.status = format!("Filled down {}", format_range(range));
@@ -547,7 +707,7 @@ impl SpreadsheetApp {
         let target = self.selected;
         let range = format_range(self.range);
         let formula = format!("={}({})", function_name, range);
-        self.cells[target.row][target.col].raw = formula.clone();
+        self.set_cell_raw(target, formula.clone());
         self.formula_input = formula;
         self.status = format!(
             "Inserted {} formula into {}",
@@ -581,11 +741,13 @@ impl SpreadsheetApp {
             return;
         }
 
+        let csv = self.csv_buffer.clone();
         self.clear_workbook();
-        let rows = parse_csv(&self.csv_buffer);
+        self.csv_buffer = csv.clone();
+        let rows = parse_csv(&csv);
         for (row, fields) in rows.iter().enumerate().take(ROWS) {
             for (col, value) in fields.iter().enumerate().take(COLS) {
-                self.cells[row][col].raw = value.clone();
+                self.set_cell_raw(CellAddress::new(row, col), value.clone());
             }
         }
         self.select_cell(CellAddress::new(0, 0));
@@ -660,9 +822,10 @@ impl SpreadsheetApp {
         for row in range.start.row..=range.end.row {
             for col in range.start.col..=range.end.col {
                 if self.cells[row][col].raw.contains(&self.find_query) {
-                    self.cells[row][col].raw = self.cells[row][col]
+                    let replaced = self.cells[row][col]
                         .raw
                         .replace(&self.find_query, &self.replace_query);
+                    self.set_cell_raw(CellAddress::new(row, col), replaced);
                     replacements += 1;
                 }
             }
@@ -695,6 +858,10 @@ impl SpreadsheetApp {
         for (row_offset, (_, row_data)) in rows.into_iter().enumerate() {
             for (col_offset, cell) in row_data.into_iter().enumerate() {
                 self.cells[range.start.row + row_offset][range.start.col + col_offset] = cell;
+                self.mark_cell_changed(CellAddress::new(
+                    range.start.row + row_offset,
+                    range.start.col + col_offset,
+                ));
             }
         }
         self.status = format!("Sorted {} by {}", format_range(range), column_name(key_col));
@@ -709,6 +876,7 @@ impl SpreadsheetApp {
 
         self.named_ranges
             .insert(name.clone(), self.range.normalized());
+        self.mark_all_dirty();
         self.status = format!("Named range '{}' = {}", name, format_range(self.range));
     }
 }
@@ -735,8 +903,18 @@ struct SortKey {
 impl SortKey {
     fn from_value(value: &CalcValue) -> Self {
         match value {
-            CalcValue::Number(number) => Self {
+            CalcValue::Number(number)
+            | CalcValue::Currency(number)
+            | CalcValue::Percent(number) => Self {
                 number: Some(OrderedFloat(*number)),
+                text: String::new(),
+            },
+            CalcValue::Date(days) => Self {
+                number: Some(OrderedFloat(*days as f64)),
+                text: String::new(),
+            },
+            CalcValue::Boolean(value) => Self {
+                number: Some(OrderedFloat(if *value { 1.0 } else { 0.0 })),
                 text: String::new(),
             },
             CalcValue::Text(text) => Self {
@@ -923,7 +1101,7 @@ impl SpreadsheetApp {
             );
 
             if response.changed() {
-                self.cells[self.selected.row][self.selected.col].raw = self.formula_input.clone();
+                self.set_cell_raw(self.selected, self.formula_input.clone());
             }
         });
     }
@@ -986,7 +1164,10 @@ impl SpreadsheetApp {
                 card(ui, |ui| {
                     ui.label(RichText::new("Formulas").strong().color(palette::TEXT));
                     ui.horizontal_wrapped(|ui| {
-                        for formula in ["SUM", "AVG", "MIN", "MAX", "COUNT"] {
+                        for formula in [
+                            "SUM", "AVG", "MIN", "MAX", "COUNT", "MEDIAN", "STDEV", "VAR",
+                            "CORREL", "SUMIF", "COUNTIF", "VLOOKUP", "XLOOKUP", "IF", "ROUNDUP",
+                        ] {
                             if ui.button(formula).clicked() {
                                 self.insert_formula(formula);
                             }
@@ -1252,13 +1433,14 @@ impl SpreadsheetApp {
             .show(ui, |ui| {
                 ui.set_min_size(Vec2::new(width, height));
                 if is_selected {
+                    let mut raw = self.cells[row][col].raw.clone();
                     let response = ui.add_sized(
                         [width - 8.0, height - 4.0],
-                        TextEdit::singleline(&mut self.cells[row][col].raw)
-                            .desired_width(width - 8.0),
+                        TextEdit::singleline(&mut raw).desired_width(width - 8.0),
                     );
                     if response.changed() {
-                        self.formula_input = self.cells[row][col].raw.clone();
+                        self.set_cell_raw(address, raw.clone());
+                        self.formula_input = raw;
                     }
                 } else {
                     let text = styled_text(label_text, style, text_color);
@@ -1296,6 +1478,8 @@ impl SpreadsheetApp {
                     .map(format_number)
                     .unwrap_or_else(|| "-".to_owned())
             ));
+            ui.separator();
+            ui.label(format!("Recalc {}", self.last_recalc_count));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(format!("{} x {}", ROWS, COLS));
             });
@@ -1401,7 +1585,7 @@ fn evaluate_cell(
     col: usize,
 ) -> CalcValue {
     if row >= ROWS || col >= COLS {
-        return CalcValue::Error("#REF".to_owned());
+        return CalcValue::Error(ERR_REF.to_owned());
     }
 
     if let Some(value) = &cache[row][col] {
@@ -1410,28 +1594,73 @@ fn evaluate_cell(
 
     let address = CellAddress::new(row, col);
     if visiting.contains(&address) {
-        return CalcValue::Error("#CYCLE".to_owned());
+        return CalcValue::Error(ERR_CYCLE.to_owned());
     }
 
     visiting.push(address);
     let raw = cells[row][col].raw.trim();
-    let value = if raw.is_empty() {
-        CalcValue::Empty
-    } else if let Some(formula) = raw.strip_prefix('=') {
+    let value = if let Some(formula) = raw.strip_prefix('=') {
         let mut parser = FormulaParser::new(formula, cells, named_ranges, cache, visiting);
         match parser.parse() {
-            Ok(number) if number.is_finite() => CalcValue::Number(number),
-            Ok(_) => CalcValue::Error("#NUM".to_owned()),
+            Ok(value) => normalize_calc_value(value),
             Err(error) => CalcValue::Error(error),
         }
-    } else if let Ok(number) = raw.parse::<f64>() {
-        CalcValue::Number(number)
     } else {
-        CalcValue::Text(raw.to_owned())
+        parse_typed_literal(raw)
     };
     visiting.pop();
     cache[row][col] = Some(value.clone());
     value
+}
+
+fn parse_typed_literal(raw: &str) -> CalcValue {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return CalcValue::Empty;
+    }
+
+    match trimmed.to_ascii_uppercase().as_str() {
+        "TRUE" => return CalcValue::Boolean(true),
+        "FALSE" => return CalcValue::Boolean(false),
+        _ => {}
+    }
+
+    if let Some(days) = parse_iso_date(trimmed) {
+        return CalcValue::Date(days);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('$') {
+        if let Some(number) = parse_number_text(rest) {
+            return CalcValue::Currency(number);
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_suffix('%') {
+        if let Some(number) = parse_number_text(rest) {
+            return CalcValue::Percent(number / 100.0);
+        }
+    }
+
+    if let Some(number) = parse_number_text(trimmed) {
+        CalcValue::Number(number)
+    } else {
+        CalcValue::Text(trimmed.to_owned())
+    }
+}
+
+fn normalize_calc_value(value: CalcValue) -> CalcValue {
+    match value {
+        CalcValue::Number(number) if !number.is_finite() => CalcValue::Error(ERR_NUM.to_owned()),
+        CalcValue::Currency(number) if !number.is_finite() => CalcValue::Error(ERR_NUM.to_owned()),
+        CalcValue::Percent(number) if !number.is_finite() => CalcValue::Error(ERR_NUM.to_owned()),
+        other => other,
+    }
+}
+
+#[derive(Clone)]
+enum FormulaArg {
+    Value(CalcValue),
+    Range(CellRange),
 }
 
 struct FormulaParser<'a> {
@@ -1461,24 +1690,56 @@ impl<'a> FormulaParser<'a> {
         }
     }
 
-    fn parse(&mut self) -> Result<f64, String> {
-        let value = self.expression()?;
+    fn parse(&mut self) -> Result<CalcValue, String> {
+        let value = self.comparison()?;
         self.skip_ws();
         if self.pos < self.chars.len() {
-            Err("#PARSE".to_owned())
+            Err(ERR_VALUE.to_owned())
         } else {
             Ok(value)
         }
     }
 
-    fn expression(&mut self) -> Result<f64, String> {
+    fn comparison(&mut self) -> Result<CalcValue, String> {
+        let mut left = self.expression()?;
+        loop {
+            self.skip_ws();
+            let operator = if self.consume_str(">=") {
+                Some(">=")
+            } else if self.consume_str("<=") {
+                Some("<=")
+            } else if self.consume_str("<>") {
+                Some("<>")
+            } else if self.consume('>') {
+                Some(">")
+            } else if self.consume('<') {
+                Some("<")
+            } else if self.consume('=') {
+                Some("=")
+            } else {
+                None
+            };
+
+            if let Some(operator) = operator {
+                let right = self.expression()?;
+                left = CalcValue::Boolean(compare_values(&left, operator, &right)?);
+            } else {
+                break;
+            }
+        }
+        Ok(left)
+    }
+
+    fn expression(&mut self) -> Result<CalcValue, String> {
         let mut value = self.term()?;
         loop {
             self.skip_ws();
             if self.consume('+') {
-                value += self.term()?;
+                let right = self.term()?;
+                value = CalcValue::Number(value_to_number(&value)? + value_to_number(&right)?);
             } else if self.consume('-') {
-                value -= self.term()?;
+                let right = self.term()?;
+                value = CalcValue::Number(value_to_number(&value)? - value_to_number(&right)?);
             } else {
                 break;
             }
@@ -1486,18 +1747,20 @@ impl<'a> FormulaParser<'a> {
         Ok(value)
     }
 
-    fn term(&mut self) -> Result<f64, String> {
+    fn term(&mut self) -> Result<CalcValue, String> {
         let mut value = self.factor()?;
         loop {
             self.skip_ws();
             if self.consume('*') {
-                value *= self.factor()?;
+                let right = self.factor()?;
+                value = CalcValue::Number(value_to_number(&value)? * value_to_number(&right)?);
             } else if self.consume('/') {
-                let divisor = self.factor()?;
+                let right = self.factor()?;
+                let divisor = value_to_number(&right)?;
                 if divisor == 0.0 {
-                    return Err("#DIV/0".to_owned());
+                    return Err(ERR_DIV_ZERO.to_owned());
                 }
-                value /= divisor;
+                value = CalcValue::Number(value_to_number(&value)? / divisor);
             } else {
                 break;
             }
@@ -1505,10 +1768,10 @@ impl<'a> FormulaParser<'a> {
         Ok(value)
     }
 
-    fn factor(&mut self) -> Result<f64, String> {
+    fn factor(&mut self) -> Result<CalcValue, String> {
         self.skip_ws();
         if self.consume('-') {
-            return Ok(-self.factor()?);
+            return Ok(CalcValue::Number(-value_to_number(&self.factor()?)?));
         }
         if self.consume('+') {
             return self.factor();
@@ -1516,19 +1779,23 @@ impl<'a> FormulaParser<'a> {
         self.primary()
     }
 
-    fn primary(&mut self) -> Result<f64, String> {
+    fn primary(&mut self) -> Result<CalcValue, String> {
         self.skip_ws();
         if self.consume('(') {
-            let value = self.expression()?;
+            let value = self.comparison()?;
             self.expect(')')?;
             return Ok(value);
+        }
+
+        if self.peek() == Some('"') {
+            return self.string_literal().map(CalcValue::Text);
         }
 
         if self
             .peek()
             .map_or(false, |ch| ch.is_ascii_digit() || ch == '.')
         {
-            return self.number();
+            return self.number_literal();
         }
 
         if self.peek().map_or(false, |ch| ch.is_ascii_alphabetic()) {
@@ -1539,46 +1806,108 @@ impl<'a> FormulaParser<'a> {
                 return self.function(&ident);
             }
 
+            match ident.to_ascii_uppercase().as_str() {
+                "TRUE" => return Ok(CalcValue::Boolean(true)),
+                "FALSE" => return Ok(CalcValue::Boolean(false)),
+                _ => {}
+            }
+
             self.pos = start;
             if let Some(address) = self.cell_ref() {
                 if self.consume(':') {
                     if let Some(end) = self.cell_ref() {
-                        return Ok(self
-                            .range_numbers(CellRange {
+                        return Ok(CalcValue::Number(kahan_sum(&self.range_numbers(
+                            CellRange {
                                 start: address,
                                 end,
-                            })?
-                            .iter()
-                            .sum());
+                            },
+                        )?)));
                     }
-                    return Err("#REF".to_owned());
+                    return Err(ERR_REF.to_owned());
                 }
-                return self.cell_number(address);
+                return self.cell_value(address);
             }
 
             self.pos = start;
             let named = self.identifier();
             if let Some(range) = lookup_named_range(self.named_ranges, &named) {
-                return Ok(self.range_numbers(range)?.iter().sum());
+                return Ok(CalcValue::Number(kahan_sum(&self.range_numbers(range)?)));
             }
         }
 
-        Err("#VALUE".to_owned())
+        Err(ERR_VALUE.to_owned())
     }
 
-    fn function(&mut self, name: &str) -> Result<f64, String> {
-        let mut values = Vec::new();
+    fn function(&mut self, name: &str) -> Result<CalcValue, String> {
+        let args = self.arguments()?;
+        let upper = name.to_ascii_uppercase();
+        match upper.as_str() {
+            "SUM" => Ok(CalcValue::Number(kahan_sum(&self.args_numbers(&args)?))),
+            "AVG" | "AVERAGE" => {
+                let numbers = self.args_numbers(&args)?;
+                if numbers.is_empty() {
+                    Err(ERR_DIV_ZERO.to_owned())
+                } else {
+                    Ok(CalcValue::Number(
+                        kahan_sum(&numbers) / numbers.len() as f64,
+                    ))
+                }
+            }
+            "MIN" => self
+                .args_numbers(&args)?
+                .into_iter()
+                .reduce(f64::min)
+                .map(CalcValue::Number)
+                .ok_or_else(|| ERR_VALUE.to_owned()),
+            "MAX" => self
+                .args_numbers(&args)?
+                .into_iter()
+                .reduce(f64::max)
+                .map(CalcValue::Number)
+                .ok_or_else(|| ERR_VALUE.to_owned()),
+            "COUNT" => Ok(CalcValue::Number(self.args_numbers(&args)?.len() as f64)),
+            "MEDIAN" => Ok(CalcValue::Number(median(self.args_numbers(&args)?)?)),
+            "STDEV" | "STDEV.S" => Ok(CalcValue::Number(std_dev(self.args_numbers(&args)?, true)?)),
+            "STDEV.P" => Ok(CalcValue::Number(std_dev(
+                self.args_numbers(&args)?,
+                false,
+            )?)),
+            "VAR" | "VAR.S" => Ok(CalcValue::Number(variance(
+                self.args_numbers(&args)?,
+                true,
+            )?)),
+            "VAR.P" => Ok(CalcValue::Number(variance(
+                self.args_numbers(&args)?,
+                false,
+            )?)),
+            "CORREL" => self.correl(&args),
+            "ABS" => Ok(CalcValue::Number(
+                value_to_number(&single_arg(&args)?)?.abs(),
+            )),
+            "ROUND" => self.round(&args, false),
+            "ROUNDUP" => self.round(&args, true),
+            "IF" => self.if_function(&args),
+            "SUMIF" => self.sumif(&args),
+            "COUNTIF" => self.countif(&args),
+            "VLOOKUP" => self.vlookup(&args),
+            "XLOOKUP" => self.xlookup(&args),
+            _ => Err(ERR_NAME.to_owned()),
+        }
+    }
+
+    fn arguments(&mut self) -> Result<Vec<FormulaArg>, String> {
+        let mut args = Vec::new();
         self.skip_ws();
         if self.consume(')') {
-            return Err("#ARGS".to_owned());
+            return Ok(args);
         }
 
         loop {
             self.skip_ws();
             if let Some(range) = self.try_range_argument() {
-                values.extend(self.range_numbers(range)?);
+                args.push(FormulaArg::Range(range));
             } else {
-                values.push(self.expression()?);
+                args.push(FormulaArg::Value(self.comparison()?));
             }
 
             self.skip_ws();
@@ -1589,41 +1918,193 @@ impl<'a> FormulaParser<'a> {
             break;
         }
 
-        let upper = name.to_ascii_uppercase();
-        match upper.as_str() {
-            "SUM" => Ok(values.iter().sum()),
-            "AVG" | "AVERAGE" => {
-                if values.is_empty() {
-                    Err("#DIV/0".to_owned())
-                } else {
-                    Ok(values.iter().sum::<f64>() / values.len() as f64)
+        Ok(args)
+    }
+
+    fn args_numbers(&mut self, args: &[FormulaArg]) -> Result<Vec<f64>, String> {
+        let mut values = Vec::new();
+        for arg in args {
+            match arg {
+                FormulaArg::Value(value) => {
+                    if let Some(number) = value.numeric_value() {
+                        values.push(number);
+                    }
+                }
+                FormulaArg::Range(range) => values.extend(self.range_numbers(*range)?),
+            }
+        }
+        Ok(values)
+    }
+
+    fn if_function(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 2 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let condition = match args[0] {
+            FormulaArg::Value(ref value) => value.truthy()?,
+            FormulaArg::Range(range) => !self.range_numbers(range)?.is_empty(),
+        };
+
+        if condition {
+            self.arg_value(args.get(1))
+        } else {
+            self.arg_value(args.get(2))
+                .or(Ok(CalcValue::Boolean(false)))
+        }
+    }
+
+    fn sumif(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 2 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let criteria_range = expect_range(args.first())?;
+        let criteria = Criteria::from_value(&self.arg_value(args.get(1))?);
+        let sum_range = match args.get(2) {
+            Some(FormulaArg::Range(range)) => Some(range.normalized()),
+            Some(_) => return Err(ERR_VALUE.to_owned()),
+            None => None,
+        };
+
+        let criteria_range = criteria_range.normalized();
+        let mut numbers = Vec::new();
+        for row in criteria_range.start.row..=criteria_range.end.row {
+            for col in criteria_range.start.col..=criteria_range.end.col {
+                let candidate = self.cell_value(CellAddress::new(row, col))?;
+                if criteria.matches(&candidate) {
+                    let target = if let Some(sum_range) = sum_range {
+                        CellAddress::new(
+                            sum_range.start.row + (row - criteria_range.start.row),
+                            sum_range.start.col + (col - criteria_range.start.col),
+                        )
+                    } else {
+                        CellAddress::new(row, col)
+                    };
+                    if target.row < ROWS && target.col < COLS {
+                        if let Some(number) = self.cell_value(target)?.numeric_value() {
+                            numbers.push(number);
+                        }
+                    }
                 }
             }
-            "MIN" => values
-                .into_iter()
-                .reduce(f64::min)
-                .ok_or_else(|| "#VALUE".to_owned()),
-            "MAX" => values
-                .into_iter()
-                .reduce(f64::max)
-                .ok_or_else(|| "#VALUE".to_owned()),
-            "COUNT" => Ok(values.len() as f64),
-            "ABS" => one_arg(values, f64::abs),
-            "ROUND" => {
-                if values.is_empty() {
-                    Err("#ARGS".to_owned())
-                } else {
-                    let places = values
-                        .get(1)
-                        .copied()
-                        .unwrap_or(0.0)
-                        .round()
-                        .clamp(0.0, 8.0);
-                    let factor = 10_f64.powf(places);
-                    Ok((values[0] * factor).round() / factor)
+        }
+        Ok(CalcValue::Number(kahan_sum(&numbers)))
+    }
+
+    fn countif(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 2 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let range = expect_range(args.first())?.normalized();
+        let criteria = Criteria::from_value(&self.arg_value(args.get(1))?);
+        let mut count = 0usize;
+        for row in range.start.row..=range.end.row {
+            for col in range.start.col..=range.end.col {
+                if criteria.matches(&self.cell_value(CellAddress::new(row, col))?) {
+                    count += 1;
                 }
             }
-            _ => Err("#NAME".to_owned()),
+        }
+        Ok(CalcValue::Number(count as f64))
+    }
+
+    fn vlookup(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 3 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let lookup = self.arg_value(args.first())?;
+        let table = expect_range(args.get(1))?.normalized();
+        let return_col = value_to_number(&self.arg_value(args.get(2))?)?.round() as usize;
+        if return_col == 0 || table.start.col + return_col - 1 > table.end.col {
+            return Err(ERR_REF.to_owned());
+        }
+
+        for row in table.start.row..=table.end.row {
+            let candidate = self.cell_value(CellAddress::new(row, table.start.col))?;
+            if compare_values(&candidate, "=", &lookup)? {
+                return self.cell_value(CellAddress::new(row, table.start.col + return_col - 1));
+            }
+        }
+        Err(ERR_NA.to_owned())
+    }
+
+    fn xlookup(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 3 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let lookup = self.arg_value(args.first())?;
+        let lookup_range = expect_range(args.get(1))?.normalized();
+        let return_range = expect_range(args.get(2))?.normalized();
+        for row in lookup_range.start.row..=lookup_range.end.row {
+            for col in lookup_range.start.col..=lookup_range.end.col {
+                let candidate = self.cell_value(CellAddress::new(row, col))?;
+                if compare_values(&candidate, "=", &lookup)? {
+                    let out_row = return_range.start.row + (row - lookup_range.start.row);
+                    let out_col = return_range.start.col + (col - lookup_range.start.col);
+                    if out_row < ROWS && out_col < COLS {
+                        return self.cell_value(CellAddress::new(out_row, out_col));
+                    }
+                    return Err(ERR_REF.to_owned());
+                }
+            }
+        }
+        if let Some(fallback) = args.get(3) {
+            self.arg_value(Some(fallback))
+        } else {
+            Err(ERR_NA.to_owned())
+        }
+    }
+
+    fn correl(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 2 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let left = match args[0] {
+            FormulaArg::Range(range) => self.range_numbers(range)?,
+            FormulaArg::Value(_) => return Err(ERR_VALUE.to_owned()),
+        };
+        let right = match args[1] {
+            FormulaArg::Range(range) => self.range_numbers(range)?,
+            FormulaArg::Value(_) => return Err(ERR_VALUE.to_owned()),
+        };
+        Ok(CalcValue::Number(correlation(&left, &right)?))
+    }
+
+    fn round(&mut self, args: &[FormulaArg], up: bool) -> Result<CalcValue, String> {
+        if args.is_empty() {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let number = value_to_number(&self.arg_value(args.first())?)?;
+        let places = args
+            .get(1)
+            .map(|arg| {
+                self.arg_value(Some(arg))
+                    .and_then(|value| value_to_number(&value))
+            })
+            .transpose()?
+            .unwrap_or(0.0)
+            .round()
+            .clamp(0.0, 8.0);
+        let factor = 10_f64.powf(places);
+        let scaled = number * factor;
+        let rounded = if up {
+            if scaled >= 0.0 {
+                scaled.ceil()
+            } else {
+                scaled.floor()
+            }
+        } else {
+            scaled.round()
+        };
+        Ok(CalcValue::Number(rounded / factor))
+    }
+
+    fn arg_value(&mut self, arg: Option<&FormulaArg>) -> Result<CalcValue, String> {
+        match arg {
+            Some(FormulaArg::Value(value)) => Ok(value.clone()),
+            Some(FormulaArg::Range(range)) => {
+                Ok(CalcValue::Number(kahan_sum(&self.range_numbers(*range)?)))
+            }
+            None => Ok(CalcValue::Empty),
         }
     }
 
@@ -1656,29 +2137,16 @@ impl<'a> FormulaParser<'a> {
         let mut numbers = Vec::new();
         for row in range.start.row..=range.end.row {
             for col in range.start.col..=range.end.col {
-                match evaluate_cell(
-                    self.cells,
-                    self.named_ranges,
-                    self.cache,
-                    self.visiting,
-                    row,
-                    col,
-                ) {
-                    CalcValue::Number(number) => numbers.push(number),
-                    CalcValue::Text(text) => {
-                        if let Ok(number) = text.trim().parse::<f64>() {
-                            numbers.push(number);
-                        }
-                    }
-                    CalcValue::Error(error) => return Err(error),
-                    CalcValue::Empty => {}
+                let value = self.cell_value(CellAddress::new(row, col))?;
+                if let Some(number) = value.numeric_value() {
+                    numbers.push(number);
                 }
             }
         }
         Ok(numbers)
     }
 
-    fn cell_number(&mut self, address: CellAddress) -> Result<f64, String> {
+    fn cell_value(&mut self, address: CellAddress) -> Result<CalcValue, String> {
         let address = clamp_address(address);
         match evaluate_cell(
             self.cells,
@@ -1688,14 +2156,12 @@ impl<'a> FormulaParser<'a> {
             address.row,
             address.col,
         ) {
-            CalcValue::Number(number) => Ok(number),
-            CalcValue::Text(text) => text.trim().parse::<f64>().map_err(|_| "#VALUE".to_owned()),
             CalcValue::Error(error) => Err(error),
-            CalcValue::Empty => Err("#VALUE".to_owned()),
+            value => Ok(value),
         }
     }
 
-    fn number(&mut self) -> Result<f64, String> {
+    fn number_literal(&mut self) -> Result<CalcValue, String> {
         let start = self.pos;
         while self
             .peek()
@@ -1703,11 +2169,32 @@ impl<'a> FormulaParser<'a> {
         {
             self.pos += 1;
         }
-        self.chars[start..self.pos]
-            .iter()
-            .collect::<String>()
-            .parse::<f64>()
-            .map_err(|_| "#VALUE".to_owned())
+        let text: String = self.chars[start..self.pos].iter().collect();
+        let number = parse_number_text(&text).ok_or_else(|| ERR_VALUE.to_owned())?;
+        if self.consume('%') {
+            Ok(CalcValue::Percent(number / 100.0))
+        } else {
+            Ok(CalcValue::Number(number))
+        }
+    }
+
+    fn string_literal(&mut self) -> Result<String, String> {
+        self.expect('"')?;
+        let mut value = String::new();
+        while let Some(ch) = self.peek() {
+            self.pos += 1;
+            if ch == '"' {
+                if self.peek() == Some('"') {
+                    value.push('"');
+                    self.pos += 1;
+                } else {
+                    return Ok(value);
+                }
+            } else {
+                value.push(ch);
+            }
+        }
+        Err(ERR_VALUE.to_owned())
     }
 
     fn identifier(&mut self) -> String {
@@ -1723,34 +2210,9 @@ impl<'a> FormulaParser<'a> {
 
     fn cell_ref(&mut self) -> Option<CellAddress> {
         self.skip_ws();
-        let start = self.pos;
-        let mut col_name = String::new();
-        while self.peek().map_or(false, |ch| ch.is_ascii_alphabetic()) {
-            col_name.push(self.chars[self.pos].to_ascii_uppercase());
-            self.pos += 1;
-        }
-
-        let digit_start = self.pos;
-        while self.peek().map_or(false, |ch| ch.is_ascii_digit()) {
-            self.pos += 1;
-        }
-
-        if col_name.is_empty() || digit_start == self.pos {
-            self.pos = start;
-            return None;
-        }
-
-        let row_number = self.chars[digit_start..self.pos]
-            .iter()
-            .collect::<String>()
-            .parse::<usize>()
-            .ok()?;
-
-        let col = column_index(&col_name)?;
-        if row_number == 0 {
-            return None;
-        }
-        Some(CellAddress::new(row_number - 1, col))
+        let (address, next) = parse_cell_ref_at(&self.chars, self.pos)?;
+        self.pos = next;
+        Some(address)
     }
 
     fn skip_ws(&mut self) {
@@ -1769,11 +2231,22 @@ impl<'a> FormulaParser<'a> {
         }
     }
 
+    fn consume_str(&mut self, expected: &str) -> bool {
+        self.skip_ws();
+        let expected_chars: Vec<char> = expected.chars().collect();
+        if self.chars[self.pos..].starts_with(&expected_chars) {
+            self.pos += expected_chars.len();
+            true
+        } else {
+            false
+        }
+    }
+
     fn expect(&mut self, expected: char) -> Result<(), String> {
         if self.consume(expected) {
             Ok(())
         } else {
-            Err("#PARSE".to_owned())
+            Err(ERR_VALUE.to_owned())
         }
     }
 
@@ -1782,12 +2255,146 @@ impl<'a> FormulaParser<'a> {
     }
 }
 
-fn one_arg(values: Vec<f64>, function: impl FnOnce(f64) -> f64) -> Result<f64, String> {
-    values
-        .first()
-        .copied()
-        .map(function)
-        .ok_or_else(|| "#ARGS".to_owned())
+#[derive(Clone)]
+struct Criteria {
+    operator: String,
+    value: CalcValue,
+}
+
+impl Criteria {
+    fn from_value(value: &CalcValue) -> Self {
+        if let CalcValue::Text(text) = value {
+            for operator in [">=", "<=", "<>", ">", "<", "="] {
+                if let Some(rest) = text.trim().strip_prefix(operator) {
+                    return Self {
+                        operator: operator.to_owned(),
+                        value: parse_typed_literal(rest.trim()),
+                    };
+                }
+            }
+        }
+
+        Self {
+            operator: "=".to_owned(),
+            value: value.clone(),
+        }
+    }
+
+    fn matches(&self, candidate: &CalcValue) -> bool {
+        compare_values(candidate, &self.operator, &self.value).unwrap_or(false)
+    }
+}
+
+fn single_arg(args: &[FormulaArg]) -> Result<CalcValue, String> {
+    match args.first() {
+        Some(FormulaArg::Value(value)) => Ok(value.clone()),
+        Some(FormulaArg::Range(_)) => Err(ERR_VALUE.to_owned()),
+        None => Err(ERR_VALUE.to_owned()),
+    }
+}
+
+fn expect_range(arg: Option<&FormulaArg>) -> Result<CellRange, String> {
+    match arg {
+        Some(FormulaArg::Range(range)) => Ok(*range),
+        _ => Err(ERR_VALUE.to_owned()),
+    }
+}
+
+fn value_to_number(value: &CalcValue) -> Result<f64, String> {
+    match value {
+        CalcValue::Empty => Ok(0.0),
+        CalcValue::Error(error) => Err(error.clone()),
+        _ => value.numeric_value().ok_or_else(|| ERR_VALUE.to_owned()),
+    }
+}
+
+fn compare_values(left: &CalcValue, operator: &str, right: &CalcValue) -> Result<bool, String> {
+    if let (Some(left_number), Some(right_number)) = (left.numeric_value(), right.numeric_value()) {
+        return Ok(match operator {
+            ">" => left_number > right_number,
+            "<" => left_number < right_number,
+            ">=" => left_number >= right_number,
+            "<=" => left_number <= right_number,
+            "<>" => (left_number - right_number).abs() > f64::EPSILON,
+            "=" => (left_number - right_number).abs() <= f64::EPSILON,
+            _ => false,
+        });
+    }
+
+    let left_text = left.text_value().to_ascii_lowercase();
+    let right_text = right.text_value().to_ascii_lowercase();
+    Ok(match operator {
+        ">" => left_text > right_text,
+        "<" => left_text < right_text,
+        ">=" => left_text >= right_text,
+        "<=" => left_text <= right_text,
+        "<>" => left_text != right_text,
+        "=" => left_text == right_text,
+        _ => false,
+    })
+}
+
+fn kahan_sum(values: &[f64]) -> f64 {
+    let mut sum = 0.0;
+    let mut compensation = 0.0;
+    for value in values {
+        let adjusted = value - compensation;
+        let next = sum + adjusted;
+        compensation = (next - sum) - adjusted;
+        sum = next;
+    }
+    sum
+}
+
+fn median(mut values: Vec<f64>) -> Result<f64, String> {
+    if values.is_empty() {
+        return Err(ERR_VALUE.to_owned());
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 0 {
+        Ok((values[middle - 1] + values[middle]) / 2.0)
+    } else {
+        Ok(values[middle])
+    }
+}
+
+fn variance(values: Vec<f64>, sample: bool) -> Result<f64, String> {
+    let divisor_adjustment = if sample { 1 } else { 0 };
+    if values.len() <= divisor_adjustment {
+        return Err(ERR_DIV_ZERO.to_owned());
+    }
+    let mean = kahan_sum(&values) / values.len() as f64;
+    let squared: Vec<f64> = values.iter().map(|value| (value - mean).powi(2)).collect();
+    Ok(kahan_sum(&squared) / (values.len() - divisor_adjustment) as f64)
+}
+
+fn std_dev(values: Vec<f64>, sample: bool) -> Result<f64, String> {
+    Ok(variance(values, sample)?.sqrt())
+}
+
+fn correlation(left: &[f64], right: &[f64]) -> Result<f64, String> {
+    if left.len() != right.len() || left.len() < 2 {
+        return Err(ERR_NA.to_owned());
+    }
+    let left_mean = kahan_sum(left) / left.len() as f64;
+    let right_mean = kahan_sum(right) / right.len() as f64;
+    let mut numerator = Vec::with_capacity(left.len());
+    let mut left_sq = Vec::with_capacity(left.len());
+    let mut right_sq = Vec::with_capacity(left.len());
+    for (left_value, right_value) in left.iter().zip(right.iter()) {
+        let left_delta = left_value - left_mean;
+        let right_delta = right_value - right_mean;
+        numerator.push(left_delta * right_delta);
+        left_sq.push(left_delta.powi(2));
+        right_sq.push(right_delta.powi(2));
+    }
+    let denominator = (kahan_sum(&left_sq) * kahan_sum(&right_sq)).sqrt();
+    if denominator == 0.0 {
+        Err(ERR_DIV_ZERO.to_owned())
+    } else {
+        Ok(kahan_sum(&numerator) / denominator)
+    }
 }
 
 fn lookup_named_range(named_ranges: &HashMap<String, CellRange>, name: &str) -> Option<CellRange> {
@@ -1795,6 +2402,93 @@ fn lookup_named_range(named_ranges: &HashMap<String, CellRange>, name: &str) -> 
         .iter()
         .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
         .map(|(_, range)| *range)
+}
+
+fn collect_dependencies(raw: &str, named_ranges: &HashMap<String, CellRange>) -> Vec<CellAddress> {
+    let Some(formula) = raw.trim().strip_prefix('=') else {
+        return Vec::new();
+    };
+
+    let chars: Vec<char> = formula.chars().collect();
+    let mut dependencies = HashSet::new();
+    let mut pos = 0;
+    while pos < chars.len() {
+        if chars[pos] == '"' {
+            pos += 1;
+            while pos < chars.len() {
+                if chars[pos] == '"' {
+                    pos += 1;
+                    break;
+                }
+                pos += 1;
+            }
+            continue;
+        }
+
+        if let Some((start, next)) = parse_cell_ref_at(&chars, pos) {
+            pos = next;
+            if pos < chars.len() && chars[pos] == ':' {
+                if let Some((end, after_end)) = parse_cell_ref_at(&chars, pos + 1) {
+                    add_range_dependencies(&mut dependencies, CellRange { start, end });
+                    pos = after_end;
+                    continue;
+                }
+            }
+            dependencies.insert(clamp_address(start));
+            continue;
+        }
+
+        if chars[pos].is_ascii_alphabetic() || chars[pos] == '_' {
+            let start = pos;
+            while pos < chars.len() && (chars[pos].is_ascii_alphanumeric() || chars[pos] == '_') {
+                pos += 1;
+            }
+            let identifier: String = chars[start..pos].iter().collect();
+            if let Some(range) = lookup_named_range(named_ranges, &identifier) {
+                add_range_dependencies(&mut dependencies, range);
+            }
+            continue;
+        }
+
+        pos += 1;
+    }
+
+    dependencies.into_iter().collect()
+}
+
+fn add_range_dependencies(target: &mut HashSet<CellAddress>, range: CellRange) {
+    let range = clamp_range(range).normalized();
+    for row in range.start.row..=range.end.row {
+        for col in range.start.col..=range.end.col {
+            target.insert(CellAddress::new(row, col));
+        }
+    }
+}
+
+fn parse_cell_ref_at(chars: &[char], start: usize) -> Option<(CellAddress, usize)> {
+    let mut pos = start;
+    let mut col_name = String::new();
+    while pos < chars.len() && chars[pos].is_ascii_alphabetic() {
+        col_name.push(chars[pos].to_ascii_uppercase());
+        pos += 1;
+    }
+
+    let digit_start = pos;
+    while pos < chars.len() && chars[pos].is_ascii_digit() {
+        pos += 1;
+    }
+
+    if col_name.is_empty() || digit_start == pos {
+        return None;
+    }
+    let row = chars[digit_start..pos]
+        .iter()
+        .collect::<String>()
+        .parse::<usize>()
+        .ok()?
+        .checked_sub(1)?;
+    let col = column_index(&col_name)?;
+    Some((clamp_address(CellAddress::new(row, col)), pos))
 }
 
 fn sanitize_range_name(input: &str) -> String {
@@ -1826,6 +2520,23 @@ fn display_value(value: &CalcValue, format: NumberFormat, show_formula: bool, ra
             NumberFormat::Currency => format!("${:.2}", number),
             NumberFormat::Percent => format!("{:.1}%", number * 100.0),
         },
+        CalcValue::Currency(number) => match format {
+            NumberFormat::Percent => format!("{:.1}%", number * 100.0),
+            _ => format!("${:.2}", number),
+        },
+        CalcValue::Percent(number) => match format {
+            NumberFormat::Currency => format!("${:.2}", number),
+            NumberFormat::Number => format!("{:.2}", number),
+            _ => format!("{:.1}%", number * 100.0),
+        },
+        CalcValue::Boolean(value) => {
+            if *value {
+                "TRUE".to_owned()
+            } else {
+                "FALSE".to_owned()
+            }
+        }
+        CalcValue::Date(days) => format_date(*days),
         CalcValue::Text(text) => text.clone(),
         CalcValue::Error(error) => error.clone(),
     }
@@ -1837,6 +2548,65 @@ fn format_number(number: f64) -> String {
     } else {
         format!("{:.2}", number)
     }
+}
+
+fn parse_number_text(text: &str) -> Option<f64> {
+    text.trim().replace(',', "").parse::<f64>().ok()
+}
+
+fn text_to_number(text: &str) -> Option<f64> {
+    let trimmed = text.trim();
+    if let Some(number) = parse_number_text(trimmed) {
+        return Some(number);
+    }
+    if let Some(rest) = trimmed.strip_prefix('$') {
+        return parse_number_text(rest);
+    }
+    if let Some(rest) = trimmed.strip_suffix('%') {
+        return parse_number_text(rest).map(|value| value / 100.0);
+    }
+    parse_iso_date(trimmed).map(|days| days as f64)
+}
+
+fn parse_iso_date(text: &str) -> Option<i64> {
+    let mut parts = text.split('-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+fn format_date(days: i64) -> String {
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146097 + doe - 719468) as i64
+}
+
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year as i32, month as u32, day as u32)
 }
 
 fn format_address(address: CellAddress) -> String {
@@ -1874,23 +2644,14 @@ fn parse_range(input: &str) -> Option<CellRange> {
 }
 
 fn parse_address(input: &str) -> Option<CellAddress> {
-    let trimmed = input.trim();
-    let mut letters = String::new();
-    let mut digits = String::new();
-
-    for ch in trimmed.chars() {
-        if ch.is_ascii_alphabetic() && digits.is_empty() {
-            letters.push(ch.to_ascii_uppercase());
-        } else if ch.is_ascii_digit() {
-            digits.push(ch);
+    let chars: Vec<char> = input.trim().chars().collect();
+    parse_cell_ref_at(&chars, 0).and_then(|(address, next)| {
+        if next == chars.len() {
+            Some(address)
         } else {
-            return None;
+            None
         }
-    }
-
-    let row = digits.parse::<usize>().ok()?.checked_sub(1)?;
-    let col = column_index(&letters)?;
-    Some(clamp_address(CellAddress::new(row, col)))
+    })
 }
 
 fn clamp_range(range: CellRange) -> CellRange {
@@ -2054,9 +2815,139 @@ mod tests {
         cells[0][1].raw = "=A1".to_owned();
 
         match evaluate_for_test(&cells, &named_ranges, 0, 0) {
-            CalcValue::Error(error) => assert_eq!(error, "#CYCLE"),
+            CalcValue::Error(error) => assert_eq!(error, ERR_CYCLE),
             other => panic!("expected cycle error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_boolean_currency_percent_and_dates() {
+        assert!(matches!(
+            parse_typed_literal("TRUE"),
+            CalcValue::Boolean(true)
+        ));
+        assert!(
+            matches!(parse_typed_literal("$1,250.50"), CalcValue::Currency(value) if (value - 1250.50).abs() < 0.001)
+        );
+        assert!(
+            matches!(parse_typed_literal("12.5%"), CalcValue::Percent(value) if (value - 0.125).abs() < 0.001)
+        );
+        assert!(matches!(
+            parse_typed_literal("2026-06-04"),
+            CalcValue::Date(_)
+        ));
+    }
+
+    #[test]
+    fn evaluates_if_sumif_countif_and_lookup_functions() {
+        let mut cells = blank_cells();
+        let named_ranges = HashMap::new();
+        for (row, value) in ["1", "2", "3", "4"].iter().enumerate() {
+            cells[row][0].raw = value.to_string();
+        }
+        for (row, value) in ["A", "B", "A", "B"].iter().enumerate() {
+            cells[row][1].raw = value.to_string();
+        }
+        cells[0][3].raw = "A".to_owned();
+        cells[0][4].raw = "Alpha".to_owned();
+        cells[1][3].raw = "B".to_owned();
+        cells[1][4].raw = "Beta".to_owned();
+
+        cells[5][0].raw = "=IF(SUM(A1:A4)>9,\"high\",\"low\")".to_owned();
+        cells[5][1].raw = "=SUMIF(B1:B4,\"A\",A1:A4)".to_owned();
+        cells[5][2].raw = "=COUNTIF(A1:A4,\">2\")".to_owned();
+        cells[5][3].raw = "=VLOOKUP(\"B\",D1:E2,2)".to_owned();
+        cells[5][4].raw = "=XLOOKUP(\"A\",D1:D2,E1:E2)".to_owned();
+
+        let if_value = evaluate_for_test(&cells, &named_ranges, 5, 0);
+        let sumif_value = evaluate_for_test(&cells, &named_ranges, 5, 1);
+        let countif_value = evaluate_for_test(&cells, &named_ranges, 5, 2);
+        let vlookup_value = evaluate_for_test(&cells, &named_ranges, 5, 3);
+        let xlookup_value = evaluate_for_test(&cells, &named_ranges, 5, 4);
+
+        assert!(
+            matches!(&if_value, CalcValue::Text(text) if text == "high"),
+            "{if_value:?}"
+        );
+        assert!(
+            matches!(sumif_value, CalcValue::Number(value) if (value - 4.0).abs() < 0.001),
+            "{sumif_value:?}"
+        );
+        assert!(
+            matches!(countif_value, CalcValue::Number(value) if (value - 2.0).abs() < 0.001),
+            "{countif_value:?}"
+        );
+        assert!(
+            matches!(&vlookup_value, CalcValue::Text(text) if text == "Beta"),
+            "{vlookup_value:?}"
+        );
+        assert!(
+            matches!(&xlookup_value, CalcValue::Text(text) if text == "Alpha"),
+            "{xlookup_value:?}"
+        );
+    }
+
+    #[test]
+    fn evaluates_statistical_functions() {
+        let mut cells = blank_cells();
+        let named_ranges = HashMap::new();
+        for (row, value) in ["1", "2", "3", "4"].iter().enumerate() {
+            cells[row][0].raw = value.to_string();
+            cells[row][1].raw = (value.parse::<i32>().unwrap() * 2).to_string();
+        }
+
+        cells[5][0].raw = "=MEDIAN(A1:A4)".to_owned();
+        cells[5][1].raw = "=VAR(A1:A4)".to_owned();
+        cells[5][2].raw = "=STDEV(A1:A4)".to_owned();
+        cells[5][3].raw = "=CORREL(A1:A4,B1:B4)".to_owned();
+        cells[5][4].raw = "=ROUNDUP(1.234,2)".to_owned();
+
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 0),
+            CalcValue::Number(value) if (value - 2.5).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 1),
+            CalcValue::Number(value) if (value - 1.6666667).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 2),
+            CalcValue::Number(value) if (value - 1.2909944).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 3),
+            CalcValue::Number(value) if (value - 1.0).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 4),
+            CalcValue::Number(value) if (value - 1.24).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn tracks_dependencies_and_recalculates_dirty_dependents() {
+        let cc = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let mut app = SpreadsheetApp::new(&cc);
+        app.clear_workbook();
+        app.set_raw(0, 0, "1");
+        app.set_raw(0, 1, "2");
+        app.set_raw(0, 2, "=A1+B1");
+
+        let values = app.evaluated_cells();
+        assert!(matches!(values[0][2], CalcValue::Number(value) if (value - 3.0).abs() < 0.001));
+
+        app.set_raw(0, 0, "5");
+        let values = app.evaluated_cells();
+        assert!(matches!(values[0][2], CalcValue::Number(value) if (value - 7.0).abs() < 0.001));
+        assert_eq!(app.last_recalc_count, 2);
+        assert_eq!(
+            app.dependencies
+                .get(&CellAddress::new(0, 2))
+                .cloned()
+                .unwrap_or_default()
+                .len(),
+            2
+        );
     }
 
     #[test]

@@ -31,9 +31,13 @@ The executable is larger than the Win32 version because it includes the GUI fram
 - formula bar
 - range box such as `A1:D12`
 - formulas: `SUM`, `AVG`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `ABS`, `ROUND`
+- expanded formulas: `IF`, `SUMIF`, `COUNTIF`, `VLOOKUP`, `XLOOKUP`, `MEDIAN`, `STDEV`, `VAR`, `CORREL`, `ROUNDUP`
 - arithmetic formulas with `+`, `-`, `*`, `/`, parentheses, and cell references
 - range formulas such as `=SUM(C2:C6)`
 - circular reference detection
+- dependency graph with cached values and dirty dependent recalculation
+- typed values for numbers, text, booleans, dates, currency, and percentages
+- Excel-like errors such as `#REF!`, `#VALUE!`, `#DIV/0!`, `#NAME?`, `#N/A`, and `#CYCLE!`
 - number, currency, and percent formatting
 - cell fill colors, bold, italic, and alignment
 - sample workbook with realistic operational data
