@@ -274,6 +274,81 @@ impl SortDirection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChartKind {
+    Bar,
+    Line,
+    Pie,
+    Scatter,
+}
+
+impl ChartKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Bar => "Bar",
+            Self::Line => "Line",
+            Self::Pie => "Pie",
+            Self::Scatter => "Scatter",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompareOperator {
+    GreaterThan,
+    LessThan,
+    Equal,
+    Between,
+}
+
+impl CompareOperator {
+    fn label(self) -> &'static str {
+        match self {
+            Self::GreaterThan => ">",
+            Self::LessThan => "<",
+            Self::Equal => "=",
+            Self::Between => "Between",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ConditionalRule {
+    range: CellRange,
+    operator: CompareOperator,
+    threshold: f64,
+    second_threshold: f64,
+    fill: FillColor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ValidationKind {
+    NumberBetween,
+    DateBetween,
+    List,
+    NonEmpty,
+}
+
+impl ValidationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NumberBetween => "Number range",
+            Self::DateBetween => "Date range",
+            Self::List => "List",
+            Self::NonEmpty => "Required",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ValidationRule {
+    range: CellRange,
+    kind: ValidationKind,
+    min: f64,
+    max: f64,
+    list: Vec<String>,
+}
+
 struct SpreadsheetApp {
     cells: Vec<Vec<SpreadsheetCell>>,
     selected: CellAddress,
@@ -290,6 +365,20 @@ struct SpreadsheetApp {
     range_name_input: String,
     sort_direction: SortDirection,
     named_ranges: HashMap<String, CellRange>,
+    filters: HashMap<usize, String>,
+    filter_column: usize,
+    filter_query: String,
+    chart_kind: ChartKind,
+    conditional_rules: Vec<ConditionalRule>,
+    conditional_operator: CompareOperator,
+    conditional_threshold: f64,
+    conditional_second_threshold: f64,
+    conditional_fill: FillColor,
+    validation_rules: Vec<ValidationRule>,
+    validation_kind: ValidationKind,
+    validation_min: f64,
+    validation_max: f64,
+    validation_list: String,
     calculated: Vec<Vec<CalcValue>>,
     dirty: Vec<Vec<bool>>,
     dependencies: HashMap<CellAddress, Vec<CellAddress>>,
@@ -321,6 +410,20 @@ impl SpreadsheetApp {
             range_name_input: "Selection".to_owned(),
             sort_direction: SortDirection::Ascending,
             named_ranges: HashMap::new(),
+            filters: HashMap::new(),
+            filter_column: 0,
+            filter_query: String::new(),
+            chart_kind: ChartKind::Bar,
+            conditional_rules: Vec::new(),
+            conditional_operator: CompareOperator::GreaterThan,
+            conditional_threshold: 0.0,
+            conditional_second_threshold: 1.0,
+            conditional_fill: FillColor::Green,
+            validation_rules: Vec::new(),
+            validation_kind: ValidationKind::NumberBetween,
+            validation_min: 0.0,
+            validation_max: 1.0,
+            validation_list: "Low,Medium,High".to_owned(),
             calculated: vec![vec![CalcValue::Empty; COLS]; ROWS],
             dirty: vec![vec![true; COLS]; ROWS],
             dependencies: HashMap::new(),
@@ -454,6 +557,34 @@ impl SpreadsheetApp {
             .insert("Spent".to_owned(), parse_range("D2:D6").unwrap());
         self.named_ranges
             .insert("Progress".to_owned(), parse_range("F2:F6").unwrap());
+        self.conditional_rules.push(ConditionalRule {
+            range: parse_range("F2:F6").unwrap(),
+            operator: CompareOperator::GreaterThan,
+            threshold: 0.7,
+            second_threshold: 1.0,
+            fill: FillColor::Green,
+        });
+        self.conditional_rules.push(ConditionalRule {
+            range: parse_range("D2:D6").unwrap(),
+            operator: CompareOperator::GreaterThan,
+            threshold: 20000.0,
+            second_threshold: 0.0,
+            fill: FillColor::Amber,
+        });
+        self.validation_rules.push(ValidationRule {
+            range: parse_range("F2:F6").unwrap(),
+            kind: ValidationKind::NumberBetween,
+            min: 0.0,
+            max: 1.0,
+            list: Vec::new(),
+        });
+        self.validation_rules.push(ValidationRule {
+            range: parse_range("G2:G6").unwrap(),
+            kind: ValidationKind::List,
+            min: 0.0,
+            max: 0.0,
+            list: vec!["Low".to_owned(), "Medium".to_owned(), "High".to_owned()],
+        });
 
         self.select_cell(CellAddress::new(1, 2));
         self.status =
@@ -463,6 +594,9 @@ impl SpreadsheetApp {
     fn clear_workbook(&mut self) {
         self.cells = vec![vec![SpreadsheetCell::default(); COLS]; ROWS];
         self.named_ranges.clear();
+        self.filters.clear();
+        self.conditional_rules.clear();
+        self.validation_rules.clear();
         self.clipboard.clear();
         self.csv_buffer.clear();
         self.reset_calculation_state();
@@ -620,6 +754,7 @@ impl SpreadsheetApp {
                     | CalcValue::Percent(value) => {
                         stats.count += 1;
                         stats.sum += value;
+                        stats.values.push(*value);
                         stats.min = stats
                             .min
                             .map_or(Some(*value), |current| Some(current.min(*value)));
@@ -879,6 +1014,103 @@ impl SpreadsheetApp {
         self.mark_all_dirty();
         self.status = format!("Named range '{}' = {}", name, format_range(self.range));
     }
+
+    fn apply_filter(&mut self) {
+        if self.filter_query.trim().is_empty() {
+            self.filters.remove(&self.filter_column);
+            self.status = format!("Cleared filter on {}", column_name(self.filter_column));
+        } else {
+            self.filters
+                .insert(self.filter_column, self.filter_query.trim().to_owned());
+            self.status = format!(
+                "Filtered {} by '{}'",
+                column_name(self.filter_column),
+                self.filter_query.trim()
+            );
+        }
+    }
+
+    fn clear_filters(&mut self) {
+        self.filters.clear();
+        self.filter_query.clear();
+        self.status = "Cleared all filters".to_owned();
+    }
+
+    fn row_matches_filters(&self, evaluated: &[Vec<CalcValue>], row: usize) -> bool {
+        if row == 0 || self.filters.is_empty() {
+            return true;
+        }
+
+        self.filters.iter().all(|(col, query)| {
+            if *col >= COLS {
+                return true;
+            }
+            let text = display_value(
+                &evaluated[row][*col],
+                self.cells[row][*col].style.format,
+                false,
+                &self.cells[row][*col].raw,
+            )
+            .to_lowercase();
+            text.contains(&query.to_lowercase())
+        })
+    }
+
+    fn add_conditional_rule(&mut self) {
+        self.conditional_rules.push(ConditionalRule {
+            range: self.range.normalized(),
+            operator: self.conditional_operator,
+            threshold: self.conditional_threshold,
+            second_threshold: self.conditional_second_threshold,
+            fill: self.conditional_fill,
+        });
+        self.status = format!("Added conditional format on {}", format_range(self.range));
+    }
+
+    fn conditional_fill_for(&self, address: CellAddress, value: &CalcValue) -> Option<FillColor> {
+        let number = value.numeric_value()?;
+        self.conditional_rules
+            .iter()
+            .rev()
+            .find(|rule| rule.range.contains(address) && compare_number_rule(number, rule))
+            .map(|rule| rule.fill)
+    }
+
+    fn add_validation_rule(&mut self) {
+        let list = self
+            .validation_list
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        self.validation_rules.push(ValidationRule {
+            range: self.range.normalized(),
+            kind: self.validation_kind,
+            min: self.validation_min,
+            max: self.validation_max,
+            list,
+        });
+        self.status = format!("Added data validation on {}", format_range(self.range));
+    }
+
+    fn is_cell_invalid(&self, address: CellAddress, value: &CalcValue) -> bool {
+        self.validation_rules
+            .iter()
+            .any(|rule| rule.range.contains(address) && !validation_passes(rule, value))
+    }
+
+    fn invalid_cell_count(&self, evaluated: &[Vec<CalcValue>]) -> usize {
+        let mut count = 0;
+        for row in 0..ROWS {
+            for col in 0..COLS {
+                if self.is_cell_invalid(CellAddress::new(row, col), &evaluated[row][col]) {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
 }
 
 trait WithEnd {
@@ -978,6 +1210,7 @@ struct SelectionStats {
     sum: f64,
     min: Option<f64>,
     max: Option<f64>,
+    values: Vec<f64>,
 }
 
 impl SelectionStats {
@@ -987,6 +1220,14 @@ impl SelectionStats {
         } else {
             Some(self.sum / self.count as f64)
         }
+    }
+
+    fn std_dev(&self) -> Option<f64> {
+        std_dev(self.values.clone(), true).ok()
+    }
+
+    fn percentile(&self, percentile_value: f64) -> Option<f64> {
+        percentile(self.values.clone(), percentile_value).ok()
     }
 }
 
@@ -1158,6 +1399,84 @@ impl SpreadsheetApp {
                                 .unwrap_or_else(|| "-".to_owned())
                         ),
                     );
+                    metric_line(
+                        ui,
+                        "Std dev",
+                        stats
+                            .std_dev()
+                            .map(format_number)
+                            .unwrap_or_else(|| "-".to_owned()),
+                    );
+                    metric_line(
+                        ui,
+                        "P25 / P50 / P75",
+                        format!(
+                            "{} / {} / {}",
+                            stats
+                                .percentile(0.25)
+                                .map(format_number)
+                                .unwrap_or_else(|| "-".to_owned()),
+                            stats
+                                .percentile(0.50)
+                                .map(format_number)
+                                .unwrap_or_else(|| "-".to_owned()),
+                            stats
+                                .percentile(0.75)
+                                .map(format_number)
+                                .unwrap_or_else(|| "-".to_owned())
+                        ),
+                    );
+                });
+
+                ui.add_space(10.0);
+                card(ui, |ui| {
+                    ui.label(RichText::new("Chart").strong().color(palette::TEXT));
+                    ComboBox::from_id_salt("chart_kind")
+                        .selected_text(self.chart_kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in [
+                                ChartKind::Bar,
+                                ChartKind::Line,
+                                ChartKind::Pie,
+                                ChartKind::Scatter,
+                            ] {
+                                ui.selectable_value(&mut self.chart_kind, kind, kind.label());
+                            }
+                        });
+                    ui.add_space(6.0);
+                    chart_view(
+                        ui,
+                        self.chart_kind,
+                        &chart_points_for_range(evaluated, self.range),
+                    );
+                });
+
+                ui.add_space(10.0);
+                card(ui, |ui| {
+                    ui.label(
+                        RichText::new("Grouped Summary")
+                            .strong()
+                            .color(palette::TEXT),
+                    );
+                    let groups = grouped_summary(evaluated, self.range);
+                    if groups.is_empty() {
+                        ui.label(
+                            RichText::new("Select at least two columns").color(palette::MUTED),
+                        );
+                    } else {
+                        for group in groups.iter().take(8) {
+                            metric_line(
+                                ui,
+                                &group.key,
+                                format!(
+                                    "sum {}  avg {}  n {}",
+                                    format_number(group.sum),
+                                    format_number(group.average()),
+                                    group.count
+                                ),
+                            );
+                        }
+                    }
                 });
 
                 ui.add_space(10.0);
@@ -1165,8 +1484,25 @@ impl SpreadsheetApp {
                     ui.label(RichText::new("Formulas").strong().color(palette::TEXT));
                     ui.horizontal_wrapped(|ui| {
                         for formula in [
-                            "SUM", "AVG", "MIN", "MAX", "COUNT", "MEDIAN", "STDEV", "VAR",
-                            "CORREL", "SUMIF", "COUNTIF", "VLOOKUP", "XLOOKUP", "IF", "ROUNDUP",
+                            "SUM",
+                            "AVG",
+                            "MIN",
+                            "MAX",
+                            "COUNT",
+                            "MEDIAN",
+                            "STDEV",
+                            "VAR",
+                            "CORREL",
+                            "SUMIF",
+                            "COUNTIF",
+                            "VLOOKUP",
+                            "XLOOKUP",
+                            "IF",
+                            "ROUNDUP",
+                            "PERCENTILE",
+                            "QUARTILE",
+                            "MODE",
+                            "COVARIANCE",
                         ] {
                             if ui.button(formula).clicked() {
                                 self.insert_formula(formula);
@@ -1201,6 +1537,31 @@ impl SpreadsheetApp {
                             self.sort_range(evaluated);
                         }
                     });
+                    ui.horizontal(|ui| {
+                        ComboBox::from_id_salt("filter_column")
+                            .selected_text(column_name(self.filter_column))
+                            .show_ui(ui, |ui| {
+                                for col in 0..COLS {
+                                    ui.selectable_value(
+                                        &mut self.filter_column,
+                                        col,
+                                        column_name(col),
+                                    );
+                                }
+                            });
+                        ui.add_sized(
+                            [118.0, 26.0],
+                            TextEdit::singleline(&mut self.filter_query).hint_text("Filter text"),
+                        );
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Apply filter").clicked() {
+                            self.apply_filter();
+                        }
+                        if ui.button("Clear filters").clicked() {
+                            self.clear_filters();
+                        }
+                    });
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("Fill down").clicked() {
                             self.fill_down();
@@ -1219,6 +1580,125 @@ impl SpreadsheetApp {
                             self.define_named_range();
                         }
                     });
+                });
+
+                ui.add_space(10.0);
+                card(ui, |ui| {
+                    ui.label(
+                        RichText::new("Conditional Formatting")
+                            .strong()
+                            .color(palette::TEXT),
+                    );
+                    ui.horizontal(|ui| {
+                        ComboBox::from_id_salt("conditional_operator")
+                            .selected_text(self.conditional_operator.label())
+                            .show_ui(ui, |ui| {
+                                for operator in [
+                                    CompareOperator::GreaterThan,
+                                    CompareOperator::LessThan,
+                                    CompareOperator::Equal,
+                                    CompareOperator::Between,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.conditional_operator,
+                                        operator,
+                                        operator.label(),
+                                    );
+                                }
+                            });
+                        ComboBox::from_id_salt("conditional_fill")
+                            .selected_text(self.conditional_fill.label())
+                            .show_ui(ui, |ui| {
+                                for fill in [
+                                    FillColor::Blue,
+                                    FillColor::Green,
+                                    FillColor::Amber,
+                                    FillColor::Rose,
+                                ] {
+                                    ui.selectable_value(
+                                        &mut self.conditional_fill,
+                                        fill,
+                                        fill.label(),
+                                    );
+                                }
+                            });
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.conditional_threshold, -100000.0..=100000.0)
+                            .text("Value"),
+                    );
+                    if self.conditional_operator == CompareOperator::Between {
+                        ui.add(
+                            egui::Slider::new(
+                                &mut self.conditional_second_threshold,
+                                -100000.0..=100000.0,
+                            )
+                            .text("And"),
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Add rule").clicked() {
+                            self.add_conditional_rule();
+                        }
+                        if ui.button("Clear rules").clicked() {
+                            self.conditional_rules.clear();
+                            self.status = "Cleared conditional formats".to_owned();
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                card(ui, |ui| {
+                    ui.label(
+                        RichText::new("Data Validation")
+                            .strong()
+                            .color(palette::TEXT),
+                    );
+                    ComboBox::from_id_salt("validation_kind")
+                        .selected_text(self.validation_kind.label())
+                        .show_ui(ui, |ui| {
+                            for kind in [
+                                ValidationKind::NumberBetween,
+                                ValidationKind::DateBetween,
+                                ValidationKind::List,
+                                ValidationKind::NonEmpty,
+                            ] {
+                                ui.selectable_value(&mut self.validation_kind, kind, kind.label());
+                            }
+                        });
+                    if matches!(
+                        self.validation_kind,
+                        ValidationKind::NumberBetween | ValidationKind::DateBetween
+                    ) {
+                        ui.add(
+                            egui::Slider::new(&mut self.validation_min, -100000.0..=100000.0)
+                                .text("Min"),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.validation_max, -100000.0..=100000.0)
+                                .text("Max"),
+                        );
+                    }
+                    if self.validation_kind == ValidationKind::List {
+                        ui.add(
+                            TextEdit::singleline(&mut self.validation_list)
+                                .hint_text("Allowed values, comma separated"),
+                        );
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Add validation").clicked() {
+                            self.add_validation_rule();
+                        }
+                        if ui.button("Clear validation").clicked() {
+                            self.validation_rules.clear();
+                            self.status = "Cleared data validation".to_owned();
+                        }
+                    });
+                    metric_line(
+                        ui,
+                        "Invalid cells",
+                        self.invalid_cell_count(evaluated).to_string(),
+                    );
                 });
 
                 if !self.named_ranges.is_empty() {
@@ -1362,6 +1842,9 @@ impl SpreadsheetApp {
                         }
 
                         for row in 0..ROWS {
+                            if !self.row_matches_filters(evaluated, row) {
+                                continue;
+                            }
                             if self.show_headers {
                                 header_cell(
                                     ui,
@@ -1400,6 +1883,9 @@ impl SpreadsheetApp {
         let is_in_range = self.range.contains(address);
         let style = self.cells[row][col].style;
         let mut fill = style.fill.color();
+        if let Some(rule_fill) = self.conditional_fill_for(address, value) {
+            fill = rule_fill.color();
+        }
         if is_in_range {
             fill = blend(fill, palette::RANGE, 0.18);
         }
@@ -1407,7 +1893,10 @@ impl SpreadsheetApp {
             fill = blend(fill, palette::BLUE, 0.24);
         }
 
-        let stroke = if is_selected {
+        let invalid = self.is_cell_invalid(address, value);
+        let stroke = if invalid {
+            Stroke::new(2.0, palette::ROSE)
+        } else if is_selected {
             Stroke::new(2.0, palette::BLUE)
         } else if is_in_range {
             Stroke::new(1.0, palette::GREEN)
@@ -1574,6 +2063,272 @@ fn blend(base: Color32, overlay: Color32, amount: f32) -> Color32 {
         (base.g() as f32 * inverse + overlay.g() as f32 * amount) as u8,
         (base.b() as f32 * inverse + overlay.b() as f32 * amount) as u8,
     )
+}
+
+#[derive(Clone)]
+struct ChartPoint {
+    label: String,
+    x: f64,
+    y: f64,
+}
+
+#[derive(Clone)]
+struct GroupSummary {
+    key: String,
+    count: usize,
+    sum: f64,
+}
+
+impl GroupSummary {
+    fn average(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum / self.count as f64
+        }
+    }
+}
+
+fn chart_points_for_range(evaluated: &[Vec<CalcValue>], range: CellRange) -> Vec<ChartPoint> {
+    let range = range.normalized();
+    let mut points = Vec::new();
+    if range.width() >= 2 {
+        for row in range.start.row..=range.end.row {
+            let label = evaluated[row][range.start.col].text_value();
+            if let Some(y) = evaluated[row][range.start.col + 1].numeric_value() {
+                points.push(ChartPoint {
+                    label: if label.is_empty() {
+                        format_address(CellAddress::new(row, range.start.col))
+                    } else {
+                        label
+                    },
+                    x: points.len() as f64,
+                    y,
+                });
+            }
+        }
+    } else {
+        for row in range.start.row..=range.end.row {
+            if let Some(y) = evaluated[row][range.start.col].numeric_value() {
+                points.push(ChartPoint {
+                    label: format_address(CellAddress::new(row, range.start.col)),
+                    x: points.len() as f64,
+                    y,
+                });
+            }
+        }
+    }
+    points
+}
+
+fn chart_view(ui: &mut Ui, kind: ChartKind, points: &[ChartPoint]) {
+    let desired = Vec2::new(ui.available_width(), 210.0);
+    let (rect, _) = ui.allocate_exact_size(desired, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, egui::CornerRadius::same(8), palette::FIELD);
+    painter.rect_stroke(
+        rect,
+        egui::CornerRadius::same(8),
+        Stroke::new(1.0, palette::BORDER),
+        egui::StrokeKind::Outside,
+    );
+
+    if points.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "Select numeric data",
+            FontId::new(14.0, FontFamily::Proportional),
+            palette::MUTED,
+        );
+        return;
+    }
+
+    match kind {
+        ChartKind::Bar => draw_bar_chart(&painter, rect, points),
+        ChartKind::Line => draw_line_chart(&painter, rect, points),
+        ChartKind::Pie => draw_pie_chart(&painter, rect, points),
+        ChartKind::Scatter => draw_scatter_chart(&painter, rect, points),
+    }
+}
+
+fn chart_bounds(points: &[ChartPoint]) -> (f64, f64, f64, f64) {
+    let min_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = points
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::INFINITY, f64::min)
+        .min(0.0);
+    let max_y = points
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max)
+        .max(0.0);
+    (min_x, max_x, min_y, max_y)
+}
+
+fn chart_pos(rect: egui::Rect, x: f64, y: f64, bounds: (f64, f64, f64, f64)) -> egui::Pos2 {
+    let plot = rect.shrink2(Vec2::new(18.0, 18.0));
+    let (min_x, max_x, min_y, max_y) = bounds;
+    let x_span = (max_x - min_x).abs().max(1.0);
+    let y_span = (max_y - min_y).abs().max(1.0);
+    egui::pos2(
+        plot.left() + ((x - min_x) / x_span) as f32 * plot.width(),
+        plot.bottom() - ((y - min_y) / y_span) as f32 * plot.height(),
+    )
+}
+
+fn draw_bar_chart(painter: &egui::Painter, rect: egui::Rect, points: &[ChartPoint]) {
+    let plot = rect.shrink2(Vec2::new(18.0, 18.0));
+    let max = points
+        .iter()
+        .map(|point| point.y.abs())
+        .fold(0.0, f64::max)
+        .max(1.0);
+    let slot = plot.width() / points.len().max(1) as f32;
+    for (index, point) in points.iter().enumerate() {
+        let height = (point.y.abs() / max) as f32 * plot.height();
+        let left = plot.left() + index as f32 * slot + slot * 0.16;
+        let right = left + slot * 0.68;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(left, plot.bottom() - height),
+            egui::pos2(right, plot.bottom()),
+        );
+        painter.rect_filled(bar, egui::CornerRadius::same(3), palette::BLUE);
+        if index < 4 {
+            painter.text(
+                egui::pos2((left + right) / 2.0, plot.bottom() + 2.0),
+                egui::Align2::CENTER_TOP,
+                &point.label,
+                FontId::new(10.0, FontFamily::Proportional),
+                palette::MUTED,
+            );
+        }
+    }
+}
+
+fn draw_line_chart(painter: &egui::Painter, rect: egui::Rect, points: &[ChartPoint]) {
+    let bounds = chart_bounds(points);
+    let mut previous = None;
+    for point in points {
+        let pos = chart_pos(rect, point.x, point.y, bounds);
+        painter.circle_filled(pos, 3.5, palette::GREEN);
+        if let Some(previous) = previous {
+            painter.line_segment([previous, pos], Stroke::new(2.0, palette::BLUE));
+        }
+        previous = Some(pos);
+    }
+}
+
+fn draw_scatter_chart(painter: &egui::Painter, rect: egui::Rect, points: &[ChartPoint]) {
+    let bounds = chart_bounds(points);
+    for point in points {
+        let pos = chart_pos(rect, point.x, point.y, bounds);
+        painter.circle_filled(pos, 4.0, palette::AMBER);
+    }
+}
+
+fn draw_pie_chart(painter: &egui::Painter, rect: egui::Rect, points: &[ChartPoint]) {
+    let total: f64 = points.iter().map(|point| point.y.max(0.0)).sum();
+    if total <= 0.0 {
+        return;
+    }
+
+    let center = rect.center();
+    let radius = rect.width().min(rect.height()) * 0.34;
+    let colors = [palette::BLUE, palette::GREEN, palette::AMBER, palette::ROSE];
+    let mut angle = -std::f32::consts::FRAC_PI_2;
+    for (index, point) in points.iter().enumerate() {
+        let sweep = (point.y.max(0.0) / total) as f32 * std::f32::consts::TAU;
+        let steps = (sweep.abs() / 0.16).ceil().max(2.0) as usize;
+        let mut vertices = Vec::with_capacity(steps + 2);
+        vertices.push(center);
+        for step in 0..=steps {
+            let current = angle + sweep * step as f32 / steps as f32;
+            vertices.push(egui::pos2(
+                center.x + radius * current.cos(),
+                center.y + radius * current.sin(),
+            ));
+        }
+        painter.add(egui::Shape::convex_polygon(
+            vertices,
+            colors[index % colors.len()],
+            Stroke::new(1.0, palette::FIELD),
+        ));
+        angle += sweep;
+    }
+}
+
+fn grouped_summary(evaluated: &[Vec<CalcValue>], range: CellRange) -> Vec<GroupSummary> {
+    let range = range.normalized();
+    if range.width() < 2 {
+        return Vec::new();
+    }
+
+    let mut groups: HashMap<String, GroupSummary> = HashMap::new();
+    for row in range.start.row..=range.end.row {
+        let key = evaluated[row][range.start.col].text_value();
+        let Some(value) = evaluated[row][range.start.col + 1].numeric_value() else {
+            continue;
+        };
+        let key = if key.is_empty() {
+            "(blank)".to_owned()
+        } else {
+            key
+        };
+        let entry = groups.entry(key.clone()).or_insert(GroupSummary {
+            key,
+            count: 0,
+            sum: 0.0,
+        });
+        entry.count += 1;
+        entry.sum += value;
+    }
+
+    let mut groups: Vec<GroupSummary> = groups.into_values().collect();
+    groups.sort_by(|left, right| right.sum.total_cmp(&left.sum));
+    groups
+}
+
+fn compare_number_rule(value: f64, rule: &ConditionalRule) -> bool {
+    match rule.operator {
+        CompareOperator::GreaterThan => value > rule.threshold,
+        CompareOperator::LessThan => value < rule.threshold,
+        CompareOperator::Equal => (value - rule.threshold).abs() <= f64::EPSILON,
+        CompareOperator::Between => {
+            let low = rule.threshold.min(rule.second_threshold);
+            let high = rule.threshold.max(rule.second_threshold);
+            value >= low && value <= high
+        }
+    }
+}
+
+fn validation_passes(rule: &ValidationRule, value: &CalcValue) -> bool {
+    match rule.kind {
+        ValidationKind::NumberBetween => value
+            .numeric_value()
+            .is_some_and(|number| number >= rule.min && number <= rule.max),
+        ValidationKind::DateBetween => {
+            matches!(value, CalcValue::Date(days) if (*days as f64) >= rule.min && (*days as f64) <= rule.max)
+        }
+        ValidationKind::List => {
+            let value = value.text_value();
+            rule.list
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(value.trim()))
+        }
+        ValidationKind::NonEmpty => {
+            !matches!(value, CalcValue::Empty)
+                && !matches!(value, CalcValue::Text(text) if text.trim().is_empty())
+        }
+    }
 }
 
 fn evaluate_cell(
@@ -1880,6 +2635,11 @@ impl<'a> FormulaParser<'a> {
                 self.args_numbers(&args)?,
                 false,
             )?)),
+            "PERCENTILE" | "PERCENTILE.INC" => self.percentile_function(&args),
+            "QUARTILE" | "QUARTILE.INC" => self.quartile_function(&args),
+            "MODE" | "MODE.SNGL" => Ok(CalcValue::Number(mode(self.args_numbers(&args)?)?)),
+            "COVARIANCE" | "COVARIANCE.S" => self.covariance_function(&args, true),
+            "COVARIANCE.P" => self.covariance_function(&args, false),
             "CORREL" => self.correl(&args),
             "ABS" => Ok(CalcValue::Number(
                 value_to_number(&single_arg(&args)?)?.abs(),
@@ -2069,6 +2829,40 @@ impl<'a> FormulaParser<'a> {
         Ok(CalcValue::Number(correlation(&left, &right)?))
     }
 
+    fn percentile_function(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 2 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let values = self.arg_numbers(args.first())?;
+        let k = value_to_number(&self.arg_value(args.get(1))?)?;
+        Ok(CalcValue::Number(percentile(values, k)?))
+    }
+
+    fn quartile_function(&mut self, args: &[FormulaArg]) -> Result<CalcValue, String> {
+        if args.len() < 2 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let values = self.arg_numbers(args.first())?;
+        let quartile = value_to_number(&self.arg_value(args.get(1))?)?.round();
+        if !(0.0..=4.0).contains(&quartile) {
+            return Err(ERR_NUM.to_owned());
+        }
+        Ok(CalcValue::Number(percentile(values, quartile / 4.0)?))
+    }
+
+    fn covariance_function(
+        &mut self,
+        args: &[FormulaArg],
+        sample: bool,
+    ) -> Result<CalcValue, String> {
+        if args.len() < 2 {
+            return Err(ERR_VALUE.to_owned());
+        }
+        let left = self.arg_numbers(args.first())?;
+        let right = self.arg_numbers(args.get(1))?;
+        Ok(CalcValue::Number(covariance(&left, &right, sample)?))
+    }
+
     fn round(&mut self, args: &[FormulaArg], up: bool) -> Result<CalcValue, String> {
         if args.is_empty() {
             return Err(ERR_VALUE.to_owned());
@@ -2105,6 +2899,17 @@ impl<'a> FormulaParser<'a> {
                 Ok(CalcValue::Number(kahan_sum(&self.range_numbers(*range)?)))
             }
             None => Ok(CalcValue::Empty),
+        }
+    }
+
+    fn arg_numbers(&mut self, arg: Option<&FormulaArg>) -> Result<Vec<f64>, String> {
+        match arg {
+            Some(FormulaArg::Range(range)) => self.range_numbers(*range),
+            Some(FormulaArg::Value(value)) => value
+                .numeric_value()
+                .map(|number| vec![number])
+                .ok_or_else(|| ERR_VALUE.to_owned()),
+            None => Err(ERR_VALUE.to_owned()),
         }
     }
 
@@ -2359,6 +3164,46 @@ fn median(mut values: Vec<f64>) -> Result<f64, String> {
     }
 }
 
+fn percentile(mut values: Vec<f64>, k: f64) -> Result<f64, String> {
+    if values.is_empty() {
+        return Err(ERR_VALUE.to_owned());
+    }
+    if !(0.0..=1.0).contains(&k) {
+        return Err(ERR_NUM.to_owned());
+    }
+    values.sort_by(f64::total_cmp);
+    if values.len() == 1 {
+        return Ok(values[0]);
+    }
+    let rank = k * (values.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        Ok(values[lower])
+    } else {
+        let weight = rank - lower as f64;
+        Ok(values[lower] * (1.0 - weight) + values[upper] * weight)
+    }
+}
+
+fn mode(values: Vec<f64>) -> Result<f64, String> {
+    if values.is_empty() {
+        return Err(ERR_NA.to_owned());
+    }
+    let mut counts: HashMap<i64, (f64, usize)> = HashMap::new();
+    for value in values {
+        let key = (value * 1_000_000.0).round() as i64;
+        let entry = counts.entry(key).or_insert((value, 0));
+        entry.1 += 1;
+    }
+    counts
+        .into_values()
+        .filter(|(_, count)| *count > 1)
+        .max_by_key(|(_, count)| *count)
+        .map(|(value, _)| value)
+        .ok_or_else(|| ERR_NA.to_owned())
+}
+
 fn variance(values: Vec<f64>, sample: bool) -> Result<f64, String> {
     let divisor_adjustment = if sample { 1 } else { 0 };
     if values.len() <= divisor_adjustment {
@@ -2371,6 +3216,24 @@ fn variance(values: Vec<f64>, sample: bool) -> Result<f64, String> {
 
 fn std_dev(values: Vec<f64>, sample: bool) -> Result<f64, String> {
     Ok(variance(values, sample)?.sqrt())
+}
+
+fn covariance(left: &[f64], right: &[f64], sample: bool) -> Result<f64, String> {
+    if left.len() != right.len() || left.is_empty() {
+        return Err(ERR_NA.to_owned());
+    }
+    let adjustment = if sample { 1 } else { 0 };
+    if left.len() <= adjustment {
+        return Err(ERR_DIV_ZERO.to_owned());
+    }
+    let left_mean = kahan_sum(left) / left.len() as f64;
+    let right_mean = kahan_sum(right) / right.len() as f64;
+    let products: Vec<f64> = left
+        .iter()
+        .zip(right.iter())
+        .map(|(left_value, right_value)| (left_value - left_mean) * (right_value - right_mean))
+        .collect();
+    Ok(kahan_sum(&products) / (left.len() - adjustment) as f64)
 }
 
 fn correlation(left: &[f64], right: &[f64]) -> Result<f64, String> {
@@ -2749,6 +3612,7 @@ mod palette {
     pub const MUTED: Color32 = Color32::from_rgb(145, 158, 174);
     pub const BLUE: Color32 = Color32::from_rgb(88, 166, 255);
     pub const GREEN: Color32 = Color32::from_rgb(78, 203, 137);
+    pub const AMBER: Color32 = Color32::from_rgb(245, 174, 76);
     pub const ROSE: Color32 = Color32::from_rgb(239, 99, 119);
     pub const RANGE: Color32 = Color32::from_rgb(83, 210, 158);
 }
@@ -2901,6 +3765,11 @@ mod tests {
         cells[5][2].raw = "=STDEV(A1:A4)".to_owned();
         cells[5][3].raw = "=CORREL(A1:A4,B1:B4)".to_owned();
         cells[5][4].raw = "=ROUNDUP(1.234,2)".to_owned();
+        cells[5][5].raw = "=PERCENTILE(A1:A4,0.75)".to_owned();
+        cells[5][6].raw = "=QUARTILE(A1:A4,1)".to_owned();
+        cells[5][7].raw = "=COVARIANCE(A1:A4,B1:B4)".to_owned();
+        cells[6][0].raw = "2".to_owned();
+        cells[6][1].raw = "=MODE(A1:A4,A7)".to_owned();
 
         assert!(matches!(
             evaluate_for_test(&cells, &named_ranges, 5, 0),
@@ -2921,6 +3790,70 @@ mod tests {
         assert!(matches!(
             evaluate_for_test(&cells, &named_ranges, 5, 4),
             CalcValue::Number(value) if (value - 1.24).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 5),
+            CalcValue::Number(value) if (value - 3.25).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 6),
+            CalcValue::Number(value) if (value - 1.75).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 5, 7),
+            CalcValue::Number(value) if (value - 3.3333333).abs() < 0.001
+        ));
+        assert!(matches!(
+            evaluate_for_test(&cells, &named_ranges, 6, 1),
+            CalcValue::Number(value) if (value - 2.0).abs() < 0.001
+        ));
+    }
+
+    #[test]
+    fn builds_grouped_summaries_and_validates_data() {
+        let mut evaluated = vec![vec![CalcValue::Empty; COLS]; ROWS];
+        evaluated[0][0] = CalcValue::Text("A".to_owned());
+        evaluated[0][1] = CalcValue::Number(10.0);
+        evaluated[1][0] = CalcValue::Text("A".to_owned());
+        evaluated[1][1] = CalcValue::Number(15.0);
+        evaluated[2][0] = CalcValue::Text("B".to_owned());
+        evaluated[2][1] = CalcValue::Number(7.0);
+
+        let groups = grouped_summary(
+            &evaluated,
+            CellRange {
+                start: CellAddress::new(0, 0),
+                end: CellAddress::new(2, 1),
+            },
+        );
+        assert_eq!(groups[0].key, "A");
+        assert_eq!(groups[0].count, 2);
+        assert!((groups[0].sum - 25.0).abs() < 0.001);
+
+        let number_rule = ValidationRule {
+            range: CellRange::single(CellAddress::new(0, 0)),
+            kind: ValidationKind::NumberBetween,
+            min: 0.0,
+            max: 1.0,
+            list: Vec::new(),
+        };
+        assert!(validation_passes(&number_rule, &CalcValue::Percent(0.75)));
+        assert!(!validation_passes(&number_rule, &CalcValue::Number(2.0)));
+
+        let list_rule = ValidationRule {
+            range: CellRange::single(CellAddress::new(0, 0)),
+            kind: ValidationKind::List,
+            min: 0.0,
+            max: 0.0,
+            list: vec!["Low".to_owned(), "High".to_owned()],
+        };
+        assert!(validation_passes(
+            &list_rule,
+            &CalcValue::Text("high".to_owned())
+        ));
+        assert!(!validation_passes(
+            &list_rule,
+            &CalcValue::Text("Medium".to_owned())
         ));
     }
 

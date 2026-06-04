@@ -32,6 +32,7 @@ The executable is larger than the Win32 version because it includes the GUI fram
 - range box such as `A1:D12`
 - formulas: `SUM`, `AVG`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `ABS`, `ROUND`
 - expanded formulas: `IF`, `SUMIF`, `COUNTIF`, `VLOOKUP`, `XLOOKUP`, `MEDIAN`, `STDEV`, `VAR`, `CORREL`, `ROUNDUP`
+- advanced analysis formulas: `PERCENTILE`, `QUARTILE`, `MODE`, `COVARIANCE`
 - arithmetic formulas with `+`, `-`, `*`, `/`, parentheses, and cell references
 - range formulas such as `=SUM(C2:C6)`
 - circular reference detection
@@ -42,6 +43,12 @@ The executable is larger than the Win32 version because it includes the GUI fram
 - cell fill colors, bold, italic, and alignment
 - sample workbook with realistic operational data
 - selection statistics: sum, average, min, max, numeric count, text count, errors
+- expanded summary panel with standard deviation and P25/P50/P75 percentiles
+- charts for selected data: bar, line, pie, and scatter
+- grouped summaries using the first selected column as a category and the second as values
+- auto-filter controls by column text
+- conditional formatting rules over selected ranges
+- data validation rules for numeric ranges, dates, lists, and required cells
 - internal copy/paste using tab-separated values
 - fill-down operation
 - sort selected ranges
