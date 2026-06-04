@@ -1,12 +1,12 @@
-# Modern Ops Studio
+# Modern Ops Spreadsheet
 
-This project is a modern themed Rust desktop application built with `eframe/egui`.
+This project is a modern spreadsheet-style Rust desktop application built with `eframe/egui`.
 
 ## Purpose
 
-This app demonstrates the productive GUI path in Rust: use a Rust-native immediate-mode GUI framework to build a polished desktop tool with much less low-level code than raw Win32.
+This app demonstrates how far a Rust-native immediate-mode GUI can be pushed toward an Excel-like desktop program without introducing a dedicated spreadsheet engine.
 
-The goal is to compare the developer experience and output against the direct Win32 version.
+The goal is to test `eframe/egui` as a serious desktop application toolkit: dense grids, editing, formulas, formatting, data operations, side panels, and CSV movement.
 
 ## Result
 
@@ -26,17 +26,26 @@ The executable is larger than the Win32 version because it includes the GUI fram
 
 ## What The App Contains
 
-- modern dark interface
-- responsive layout
-- side navigation
-- dashboard metric cards
-- ticket board
-- asset health cards
-- automation rules
-- settings controls
-- progress indicators
-- custom trend chart
-- event stream
+- 80 x 26 spreadsheet grid
+- A1-style cell addressing
+- formula bar
+- range box such as `A1:D12`
+- formulas: `SUM`, `AVG`, `AVERAGE`, `MIN`, `MAX`, `COUNT`, `ABS`, `ROUND`
+- arithmetic formulas with `+`, `-`, `*`, `/`, parentheses, and cell references
+- range formulas such as `=SUM(C2:C6)`
+- circular reference detection
+- number, currency, and percent formatting
+- cell fill colors, bold, italic, and alignment
+- sample workbook with realistic operational data
+- selection statistics: sum, average, min, max, numeric count, text count, errors
+- internal copy/paste using tab-separated values
+- fill-down operation
+- sort selected ranges
+- find and replace inside a selected range
+- named range registry
+- CSV export/import text buffer
+- show-formulas mode
+- zoom control
 
 ## GUI Stack
 
@@ -56,7 +65,7 @@ This keeps the dependency set smaller than the default `wgpu` backend while stil
 - clean modern styling
 - built-in layout and resize behavior
 - cross-platform direction
-- good fit for dashboards, tools, editors, and internal apps
+- good fit for dashboards, tools, spreadsheet-like internal apps, editors, and dense operations tools
 
 ### Tradeoffs
 
@@ -64,6 +73,7 @@ This keeps the dependency set smaller than the default `wgpu` backend while stil
 - more dependencies
 - first full release build takes longer
 - visual style is framework-driven rather than native Windows controls
+- large Excel-class behavior still requires a dedicated data model, formula engine, file format support, and extensive optimization
 
 ## Build
 
